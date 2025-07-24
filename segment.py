@@ -28,6 +28,7 @@ class ChosenModel(Enum):
     SAM2 = 2
     SEMANTIC_SAM = 3
     MASK2FORMER = 4
+    GROUNDING_SAM2 = 5  # Nova opção para text2obj segmentation
 
 DINOV2_PATCH_SIZE = 14
 
@@ -213,8 +214,8 @@ def draw_label_on_mask(image, mask, label, color, font_scale=0.6, thickness=1):
 
 def load_crop_features_and_index():
     CROP_FEATURE_FILES = {
-        'real': ('data/crop_real.npz', 'data/crop_real.csv'),
-        'game': ('data/crop_game.npz', 'data/crop_game.csv'),
+        'real': ('/mnt/e/EPE/data/crop_real.npz', '/mnt/e/EPE/data/crop_real.csv'),
+        'game': ('/mnt/e/EPE/data/crop_game.npz', '/mnt/e/EPE/data/crop_game.csv'),
     }
     all_features = {}
     path_to_feature = {}
@@ -343,7 +344,7 @@ def apply_sam2(files, src_folder, dst_folder):
     checkpoint = "models/sam2.1_hiera_large.pt"
     model_cfg = "sam2.1/sam2.1_hiera_l.yaml"
     hydra.core.global_hydra.GlobalHydra.instance().clear()
-    hydra.initialize_config_dir(version_base="1.3", config_dir="/mnt/e/epe/sam2/sam2/configs")
+    hydra.initialize_config_dir(version_base="1.3", config_dir="/mnt/e/Segmenter/sam2/sam2/configs")
 
     sam2 = build_sam2(model_cfg, checkpoint, device=DEVICE, apply_postprocessing=False)
     mask_generator = SAM2AutomaticMaskGenerator(
@@ -450,18 +451,113 @@ def apply_mask2former(files, src_folder, dst_folder):
         if COPY_REFERENCE_TO_OUTPUT_FOLDER:
             shutil.copy(src_path, dst_path_ref)
 
-def apply_dinomask(files, src_folder, dst_folder):
-    pass
+def apply_grounding_sam2(files, src_folder, dst_folder, text_prompt):
+    print("INITIALIZING GROUNDING DINO + SAM2...")
+
+    # Grounding DINO
+    grounding_model = load_model(
+        model_config_path="Grounded-SAM-2/grounding_dino/groundingdino/config/GroundingDINO_SwinB_cfg.py",
+        model_checkpoint_path="models/groundingdino_swinb_cogcoor.pth",
+        device=DEVICE
+    )
+
+    checkpoint = "models/sam2.1_hiera_large.pt"
+    model_cfg = "sam2.1/sam2.1_hiera_l.yaml"
+    hydra.core.global_hydra.GlobalHydra.instance().clear()
+    hydra.initialize_config_dir(version_base="1.3", config_dir="/mnt/e/Segmenter/sam2/sam2/configs")
+    sam2_model = build_sam2(model_cfg, checkpoint, device=DEVICE)
+    sam2_predictor = SAM2ImagePredictor(sam2_model)
+
+    targets = TEXT_PROMPT.replace(" ", "").split(".")
+    print(f"TARGETS = {targets}")
+    
+    for index, file in enumerate(files):
+        print(f"[GROUNDING SAM2] Processando: {index + 1}/{len(files)} - {file}")
+        src_path = os.path.join(src_folder, file)
+        dst_path = os.path.join(dst_folder, file)
+        dst_path_ref = os.path.join(dst_folder, os.path.splitext(file)[0] + "_ref.png")
+        dst_path_ghost = os.path.join(dst_folder, os.path.splitext(file)[0] + "_ghost.png")
+
+        original_image = np.array(original_image.convert("RGB"))
+        
+        # 1. Carregar imagem
+        image_source, image = load_image(src_path)
+        height, width = image_source.shape[:2]
+        
+        # 2. Grounding DINO detecta objetos
+        boxes, confidences, phrases = predict(
+            model=grounding_model,
+            image=image,
+            caption=text_prompt,
+            box_threshold=0.35,
+            text_threshold=0.25,
+            device=DEVICE
+        )
+        
+        if len(boxes) == 0:
+            print(f"Nenhum objeto detectado")
+            continue
+        
+        print(f"Detectados: {phrases}")
+        
+        # 3. SAM2 segmenta usando pontos (centros das bounding boxes)
+        sam2_predictor.set_image(image_source)
+        
+        # Converter bounding boxes em pontos (centros)
+        point_coords = []
+        point_labels = []
+        
+        for index, box in enumerate(boxes.cpu().numpy()):
+            x1, y1, x2, y2 = box
+            center_x = (x1 + x2) / 2
+            center_y = (y1 + y2) / 2
+            absolute_center_x = center_x * width
+            absolute_center_y = center_y * height
+            point_coords.append([absolute_center_x, absolute_center_y])
+            point_labels.append(1)  # 1 = foreground point, 0 = background point
+        
+        point_coords = np.array(point_coords)
+        point_labels = np.array(point_labels)
+        
+        masks, scores, logits = sam2_predictor.predict(
+            point_coords=point_coords,
+            point_labels=point_labels,
+            box=None,
+            multimask_output=False,
+        )
+        
+        # 4. Criar imagem de saída simples
+        result = np.zeros((height, width, 3), dtype=np.uint8)
+        # Aplicar cada máscara com uma cor
+        for i, mask in enumerate(masks):
+            if mask.ndim == 3:
+                mask = mask.squeeze(0)
+            mask_bool = mask > 0.5
+            detected_phrase = phrases[i]
+            color = COLOR_MAP[targets.index(detected_phrase)]
+            result[mask_bool] = color
+        # 5. Salvar resultado
+
+        if SAVE_SEGMENTATION_WITH_ORIGINAL_GHOST:
+            mask_colored_copy = cv2.addWeighted(original_image, GHOST_ALPHA, mask_colored_copy, 1 - GHOST_ALPHA, 0)
+            Image.fromarray(mask_colored_copy).save(dst_path_ghost)
+
+        Image.fromarray(result).save(dst_path)
+
+        if COPY_REFERENCE_TO_OUTPUT_FOLDER:
+            shutil.copy(src_path, dst_path_ref)
+
 
 if __name__ == "__main__":
 
     # print(open_clip.list_pretrained())
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-    src_folder = "data/dataset"
-    dst_folder = "data/dataset_labels"
-    CHOSEN_MODEL = ChosenModel.SAM2
-    SEMANTIC_ASSISTANT = ConstSemanticAssistant.DINO_V2
+    src_folder = "input/"
+    dst_folder = "output/"
+    CHOSEN_MODEL = ChosenModel.GROUNDING_SAM2
+    SEMANTIC_ASSISTANT = ConstSemanticAssistant.NONE
+    TEXT_PROMPT = "submarine. fish. shark. jellyfish. coral. kelp. sea."  # Prompt de texto para detecção
     SEMANTIC_ASSISTANT_CROP_STYLE = SemanticAssistantCropStyle.MEAN
     SEGMENTATION_COLOR_TYPE = SegmentationColorType.COLORED
     SAVE_MASKS = False
@@ -497,7 +593,7 @@ if __name__ == "__main__":
         AMOUNT_CLUSTERS = 20
         COLOR_MAP = generate_distinct_colors(AMOUNT_CLUSTERS)
 
-        CENTROIDS_FILE = "data/dino_centroids.npy"
+        CENTROIDS_FILE = "/mnt/e/EPE/data/dino_centroids.npy"
         FORCE_RECOMPUTE_CENTROIDS = False
         ALL_FEATURES, PATH_TO_FEATURE = load_crop_features_and_index()
         print(f"Available vectors: {sum([v.shape[0] for v in ALL_FEATURES.values()])}")
@@ -525,7 +621,7 @@ if __name__ == "__main__":
 
     src_files = os.listdir(src_folder)
     src_files = [f for f in src_files if f.lower().endswith((".jpg", ".png", ".jpeg"))]
-    src_files = src_files[:10]
+    # src_files = src_files[:2]
 
     with torch.inference_mode():
 
@@ -553,4 +649,13 @@ if __name__ == "__main__":
             from detectron2.projects.deeplab import add_deeplab_config
             from mask2former import add_maskformer2_config
             apply_mask2former(src_files, src_folder, dst_folder)
+        elif CHOSEN_MODEL == ChosenModel.GROUNDING_SAM2:
+
+            COLOR_MAP = generate_distinct_colors(len(TEXT_PROMPT.replace(" ", "").split(".")))
+
+            import hydra
+            from sam2.build_sam import build_sam2
+            from sam2.sam2_image_predictor import SAM2ImagePredictor
+            from groundingdino.util.inference import load_model, load_image, predict
+            apply_grounding_sam2(src_files, src_folder, dst_folder, TEXT_PROMPT)
         
